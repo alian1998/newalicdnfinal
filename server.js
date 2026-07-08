@@ -52,13 +52,15 @@ async function syncBackendImages() {
   try {
     // 1. Call /check API
     const checkRes = await axios.get(`${MAIN_BACKEND_URL}/api/v1/image-export/check`);
+    const checkData = checkRes.data?.data;
 
-    if (!checkRes.data || !checkRes.data.hasChanges) {
+    if (!checkData || !checkData.hasChanges) {
       console.log('[CDN Sync] No changes detected or pending images remaining.');
       return;
     }
 
-    console.log(`[CDN Sync] Pending images detected! Triggering manifest fetch...`);
+    const pendingCount = checkData.pendingSync?.pendingCount ?? 0;
+    console.log(`[CDN Sync] Pending images detected (${pendingCount})! Triggering manifest fetch...`);
 
     // 2. Call /manifest?dedupe=true&linksOnly=true
     const manifestRes = await axios.get(`${MAIN_BACKEND_URL}/api/v1/image-export/manifest?dedupe=true&linksOnly=true`);
