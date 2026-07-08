@@ -13,8 +13,29 @@ app.use(express.json());
 // Envs
 const PORT = process.env.PORT || 3000;
 const MAIN_BACKEND_URL = process.env.MAIN_BACKEND_URL || 'https://api.baaziwin.com';
-const CDN_DOMAIN = process.env.CDN_DOMAIN || 'https://your-app.sslip.io';
+const CDN_DOMAIN = process.env.CDN_DOMAIN || 'https://cdn.dabitdada.live';
 const CDN_SECRET_KEY = process.env.CDN_SECRET_KEY || 'baaziwin_cdn_secret_key_2026';
+
+// Only mirror first-party uploads. Third-party CDN URLs pass through unchanged.
+const MIRROR_URL_PATTERNS = [
+  /^https?:\/\/api\.baaziwin\.com\/uploads\//i,
+];
+
+const PASS_THROUGH_URL_PATTERNS = [
+  /^https?:\/\/api\.deshibazi\.com\/uploads\//i,
+  /^https?:\/\/images\.gscplusmd\.com\//i,
+  /velkigames365\.cc/i,
+];
+
+function shouldMirrorUrl(sourceUrl) {
+  if (typeof sourceUrl !== 'string' || !sourceUrl) return false;
+
+  if (PASS_THROUGH_URL_PATTERNS.some((pattern) => pattern.test(sourceUrl))) {
+    return false;
+  }
+
+  return MIRROR_URL_PATTERNS.some((pattern) => pattern.test(sourceUrl));
+}
 
 // Directory & Database Paths
 const STORAGE_DIR = path.join(__dirname, 'storage', 'images');
@@ -36,6 +57,17 @@ db.exec(`
     last_seen_at DATETIME
   );
 `);
+
+function resolveCdnUrl(sourceUrl) {
+  if (!shouldMirrorUrl(sourceUrl)) return null;
+
+  const record = db.prepare("SELECT cdn_url, status FROM image_map WHERE source_url = ?").get(sourceUrl);
+  if (record && record.status === 'active') {
+    return record.cdn_url;
+  }
+
+  return null;
+}
 
 // Authentication Middleware
 const authCheck = (req, res, next) => {
@@ -73,6 +105,16 @@ async function syncBackendImages() {
 
     console.log(`[CDN Sync] Manifest fetched: ${sourceImages.length} URLs`);
 
+    const mirrorUrls = sourceImages.filter((url) => shouldMirrorUrl(url));
+    const skippedCount = sourceImages.length - mirrorUrls.length;
+
+    console.log(`[CDN Sync] Mirror targets: ${mirrorUrls.length}, pass-through skipped: ${skippedCount}`);
+
+    if (mirrorUrls.length === 0) {
+      console.log('[CDN Sync] No mirrorable URLs in manifest batch.');
+      return;
+    }
+
     const upsertStmt = db.prepare(`
       INSERT INTO image_map (source_url, hash_id, cdn_url, status, last_seen_at)
       VALUES (?, ?, ?, 'active', CURRENT_TIMESTAMP)
@@ -81,10 +123,8 @@ async function syncBackendImages() {
         last_seen_at = CURRENT_TIMESTAMP
     `);
 
-    // 3. Process each image & send webhook confirmation
-    for (const sourceUrl of sourceImages) {
-      if (typeof sourceUrl !== 'string') continue;
-
+    // 3. Process each mirrorable image & send webhook confirmation
+    for (const sourceUrl of mirrorUrls) {
       const hash = crypto.createHash('md5').update(sourceUrl).digest('hex');
       const filename = `${hash}.webp`;
       const filePath = path.join(STORAGE_DIR, filename);
@@ -138,9 +178,9 @@ app.get('/api/cdn-image-map', authCheck, (req, res) => {
   const sourceUrl = req.query.source;
   if (!sourceUrl) return res.status(400).json({ error: 'Source URL is required' });
 
-  const record = db.prepare("SELECT cdn_url, status FROM image_map WHERE source_url = ?").get(sourceUrl);
-  if (record && record.status === 'active') {
-    return res.json({ found: true, cdnUrl: record.cdn_url });
+  const cdnUrl = resolveCdnUrl(sourceUrl);
+  if (cdnUrl) {
+    return res.json({ found: true, cdnUrl });
   }
   return res.json({ found: false, cdnUrl: null });
 });
@@ -150,15 +190,8 @@ app.post('/api/cdn-image-map/bulk', authCheck, (req, res) => {
   if (!Array.isArray(sourceUrls)) return res.status(400).json({ error: 'sourceUrls must be an array' });
 
   const result = {};
-  const stmt = db.prepare("SELECT cdn_url, status FROM image_map WHERE source_url = ?");
-
   for (const url of sourceUrls) {
-    const record = stmt.get(url);
-    if (record && record.status === 'active') {
-      result[url] = record.cdn_url;
-    } else {
-      result[url] = null;
-    }
+    result[url] = resolveCdnUrl(url);
   }
 
   return res.json({ found: true, data: result });
