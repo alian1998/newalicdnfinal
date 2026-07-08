@@ -1,0 +1,15 @@
+{
+  "name": "custom-cdn-server",
+  "version": "1.0.0",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "axios": "^1.7.0",
+    "better-sqlite3": "^11.0.0",
+    "express": "^4.19.0",
+    "node-cron": "^3.0.3",
+    "sharp": "^0.33.0"
+  }
+}
