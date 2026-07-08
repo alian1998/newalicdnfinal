@@ -64,12 +64,14 @@ async function syncBackendImages() {
 
     // 2. Call /manifest?dedupe=true&linksOnly=true
     const manifestRes = await axios.get(`${MAIN_BACKEND_URL}/api/v1/image-export/manifest?dedupe=true&linksOnly=true`);
-    const sourceImages = manifestRes.data.images || manifestRes.data.data || manifestRes.data || [];
+    const sourceImages = manifestRes.data?.data?.images;
 
     if (!Array.isArray(sourceImages) || sourceImages.length === 0) {
       console.log('[CDN Sync] Manifest returned no URLs.');
       return;
     }
+
+    console.log(`[CDN Sync] Manifest fetched: ${sourceImages.length} URLs`);
 
     const upsertStmt = db.prepare(`
       INSERT INTO image_map (source_url, hash_id, cdn_url, status, last_seen_at)
