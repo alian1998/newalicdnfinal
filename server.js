@@ -12,9 +12,9 @@ app.use(express.json());
 
 // Envs
 const PORT = process.env.PORT || 3000;
-const MAIN_BACKEND_URL = process.env.MAIN_BACKEND_URL || 'https://your-main-backend.com';
-const CDN_DOMAIN = process.env.CDN_DOMAIN || 'https://cdn.yourdomain.com';
-const CDN_SECRET_KEY = process.env.CDN_SECRET_KEY || 'my_super_secret_key';
+const MAIN_BACKEND_URL = process.env.MAIN_BACKEND_URL || 'https://api.baaziwin.com';
+const CDN_DOMAIN = process.env.CDN_DOMAIN || 'https://your-app.sslip.io';
+const CDN_SECRET_KEY = process.env.CDN_SECRET_KEY || 'baaziwin_cdn_secret_key_2026';
 
 // Directory & Database Paths
 const STORAGE_DIR = path.join(__dirname, 'storage', 'images');
@@ -35,10 +35,6 @@ db.exec(`
     status TEXT DEFAULT 'active',
     last_seen_at DATETIME
   );
-  CREATE TABLE IF NOT EXISTS meta_info (
-    key TEXT PRIMARY KEY,
-    value TEXT
-  );
 `);
 
 // Authentication Middleware
@@ -50,21 +46,28 @@ const authCheck = (req, res, next) => {
   next();
 };
 
-// Sync Function Logic
+// Sync Function Logic with Webhook Confirmation
 async function syncBackendImages() {
   console.log('[CDN Sync] Checking for backend updates...');
   try {
-    const versionRow = db.prepare("SELECT value FROM meta_info WHERE key = 'last_version'").get();
-    const lastVersion = versionRow ? versionRow.value : '';
+    // 1. Call /check API
+    const checkRes = await axios.get(`${MAIN_BACKEND_URL}/api/v1/image-export/check`);
 
-    const checkRes = await axios.get(`${MAIN_BACKEND_URL}/api/v1/image-export/check?since=${lastVersion}`);
     if (!checkRes.data || !checkRes.data.hasChanges) {
-      console.log('[CDN Sync] No changes detected.');
+      console.log('[CDN Sync] No changes detected or pending images remaining.');
       return;
     }
 
-    const manifestRes = await axios.get(`${MAIN_BACKEND_URL}/api/v1/image-export/manifest`);
-    const sourceImages = manifestRes.data.images || [];
+    console.log(`[CDN Sync] Pending images detected! Triggering manifest fetch...`);
+
+    // 2. Call /manifest?dedupe=true&linksOnly=true
+    const manifestRes = await axios.get(`${MAIN_BACKEND_URL}/api/v1/image-export/manifest?dedupe=true&linksOnly=true`);
+    const sourceImages = manifestRes.data.images || manifestRes.data.data || manifestRes.data || [];
+
+    if (!Array.isArray(sourceImages) || sourceImages.length === 0) {
+      console.log('[CDN Sync] Manifest returned no URLs.');
+      return;
+    }
 
     const upsertStmt = db.prepare(`
       INSERT INTO image_map (source_url, hash_id, cdn_url, status, last_seen_at)
@@ -74,44 +77,48 @@ async function syncBackendImages() {
         last_seen_at = CURRENT_TIMESTAMP
     `);
 
+    // 3. Process each image & send webhook confirmation
     for (const sourceUrl of sourceImages) {
+      if (typeof sourceUrl !== 'string') continue;
+
       const hash = crypto.createHash('md5').update(sourceUrl).digest('hex');
       const filename = `${hash}.webp`;
       const filePath = path.join(STORAGE_DIR, filename);
 
+      let isSuccess = false;
+
       if (!fs.existsSync(filePath)) {
         try {
-          const response = await axios.get(sourceUrl, { responseType: 'arraybuffer' });
+          const response = await axios.get(sourceUrl, { responseType: 'arraybuffer', timeout: 10000 });
           await sharp(response.data).webp({ quality: 80 }).toFile(filePath);
+          isSuccess = true;
         } catch (err) {
-          console.error(`[CDN Sync] Failed to download image: ${sourceUrl}`);
-          continue;
+          console.error(`[CDN Sync] Failed to download image: ${sourceUrl} - ${err.message}`);
         }
+      } else {
+        isSuccess = true; // Already exists locally
       }
 
-      const cdnUrl = `${CDN_DOMAIN}/images/${filename}`;
-      upsertStmt.run(sourceUrl, hash, cdnUrl);
+      if (isSuccess) {
+        const cdnUrl = `${CDN_DOMAIN}/images/${filename}`;
+        upsertStmt.run(sourceUrl, hash, cdnUrl);
+
+        // 4. Send Webhook notification to backend
+        try {
+          await axios.post(`${MAIN_BACKEND_URL}/api/v1/image-export/cdn-webhook`, {
+            sourceUrl: sourceUrl,
+            cdnUrl: cdnUrl,
+            status: 'synced'
+          }, {
+            headers: { 'x-api-key': CDN_SECRET_KEY }
+          });
+        } catch (webhookErr) {
+          console.error(`[Webhook Error] Failed to notify backend for ${sourceUrl}: ${webhookErr.message}`);
+        }
+      }
     }
 
-    // Handle Removed Images
-    if (sourceImages.length > 0) {
-      const placeholders = sourceImages.map(() => '?').join(',');
-      db.prepare(`
-        UPDATE image_map 
-        SET status = 'deleted' 
-        WHERE source_url NOT IN (${placeholders})
-      `).run(...sourceImages);
-    }
-
-    // Save current version
-    if (checkRes.data.currentVersion) {
-      db.prepare(`
-        INSERT INTO meta_info (key, value) VALUES ('last_version', ?)
-        ON CONFLICT(key) DO UPDATE SET value = excluded.value
-      `).run(String(checkRes.data.currentVersion));
-    }
-
-    console.log('[CDN Sync] Sync completed successfully.');
+    console.log('[CDN Sync] Batch processing completed.');
   } catch (error) {
     console.error('[CDN Sync Error]:', error.message);
   }
